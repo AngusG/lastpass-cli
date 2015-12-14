@@ -88,10 +88,10 @@ int cmd_show(int argc, char **argv)
 		{"color", required_argument, NULL, 'C'},
 		{"basic-regexp", no_argument, NULL, 'G'},
 		{"fixed-strings", no_argument, NULL, 'F'},
+		{"expand-multi", no_argument, NULL, 'x'},
 		{0, 0, 0, 0}
 	};
 
-	int ids;
 	int option;
 	int option_index;
 	enum { ALL, USERNAME, PASSWORD, URL, FIELD, ID, NAME, NOTES } choice = ALL;
@@ -99,14 +99,15 @@ int cmd_show(int argc, char **argv)
 	struct account *notes_expansion = NULL;
 	struct field *found_field;
 	char *name, *pretty_field;
-	struct account *found, *last_found;
+	struct account *found, *last_found, *account;
 	enum blobsync sync = BLOB_SYNC_AUTO;
 	bool clip = false;
-	struct list_head matches;
+	bool expand_multi = false;
+	struct list_head matches, potential_set;
 	enum search_type search = SEARCH_EXACT_MATCH;
 	int fields = ACCOUNT_NAME | ACCOUNT_ID | ACCOUNT_FULLNAME;
 
-	while ((option = getopt_long(argc, argv, "cupFG", long_options, &option_index)) != -1) {
+	while ((option = getopt_long(argc, argv, "cupFGx", long_options, &option_index)) != -1) {
 		switch (option) {
 			case 'S':
 				sync = parse_sync_string(optarg);
@@ -149,6 +150,9 @@ int cmd_show(int argc, char **argv)
 				terminal_set_color_mode(
 					parse_color_mode_string(optarg));
 				break;
+			case 'x':
+				expand_multi = true;
+				break;
 			case '?':
 			default:
 				die_usage(cmd_show_usage);
@@ -158,49 +162,70 @@ int cmd_show(int argc, char **argv)
 	if (argc - optind < 1)
 		die_usage(cmd_show_usage);
 
-	ids = optind;
+	if (argc - optind > 1) {
+		/*
+		 * if multiple search criteria supplied, go ahead
+		 * and expand all matches
+		 */
+		expand_multi = true;
+	}
 
 	init_all(sync, key, &session, &blob);
 
-	while(argc - ids > 0) {
+	INIT_LIST_HEAD(&matches);
+	INIT_LIST_HEAD(&potential_set);
 
-		name = argv[ids];
-		ids++;
+	list_for_each_entry(account, &blob->account_head, list)
+		list_add(&account->match_list, &potential_set);
 
-		INIT_LIST_HEAD(&matches);
+	for (; optind < argc; optind++) {
+
+		name = argv[optind];
+
 		switch (search) {
 		case SEARCH_EXACT_MATCH:
-			find_matching_accounts(blob, name, &matches);
+			find_matching_accounts(&potential_set, name, &matches);
 			break;
 		case SEARCH_BASIC_REGEX:
-			find_matching_regex(blob, name, fields, &matches);
+			find_matching_regex(&potential_set, name, fields, &matches);
 			break;
 		case SEARCH_FIXED_SUBSTRING:
-			find_matching_substr(blob, name, fields, &matches);
+			find_matching_substr(&potential_set, name, fields, &matches);
 			break;
 		}
+	}
 
-		if (list_empty(&matches))
-			die("Could not find specified account '%s'.", name);
+	if (list_empty(&matches))
+		die("Could not find specified account(s).");
 
-		found = list_first_entry(&matches, struct account, match_list);
-		last_found = list_last_entry(&matches, struct account, match_list);
-		if (found != last_found) {
-			/* Multiple matches; dump the ids and exit */
-			terminal_printf(TERMINAL_FG_YELLOW TERMINAL_BOLD "Multiple matches found.\n");
-			list_for_each_entry(found, &matches, match_list)
+	found = list_first_entry(&matches, struct account, match_list);
+	last_found = list_last_entry(&matches, struct account, match_list);
+	if (found != last_found && !expand_multi) {
+		/* Multiple matches; dump the ids and exit */
+		terminal_printf(TERMINAL_FG_YELLOW TERMINAL_BOLD "Multiple matches found.\n");
+		list_for_each_entry(found, &matches, match_list)
 			print_header(found);
-			exit(EXIT_SUCCESS);
-		}
+		exit(EXIT_SUCCESS);
+	}
 
+	/* reprompt if necessary for any matched item */
+	list_for_each_entry(found, &matches, match_list) {
 		if (found->pwprotect) {
 			unsigned char pwprotect_key[KDF_HASH_LEN];
 			if (!agent_load_key(pwprotect_key))
 				die("Could not authenticate for protected entry.");
 			if (memcmp(pwprotect_key, key, KDF_HASH_LEN))
 				die("Current key is not on-disk key.");
+			break;
 		}
+	}
 
+	if (clip)
+		clipboard_open();
+
+	list_for_each_entry(account, &matches, match_list) {
+
+		found = account;
 		lastpass_log_access(sync, session, key, found);
 
 		notes_expansion = notes_expand(found);
@@ -229,9 +254,6 @@ int cmd_show(int argc, char **argv)
 		else if (choice == NOTES)
 			value = xstrdup(found->note);
 
-		if (clip)
-			clipboard_open();
-
 		if (choice == ALL) {
 			print_header(found);
 
@@ -256,6 +278,8 @@ int cmd_show(int argc, char **argv)
 			if (!clip)
 				putchar('\n');
 		}
+
+		account_free(notes_expansion);
 	}
 
 	account_free(notes_expansion);
